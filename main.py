@@ -81,7 +81,7 @@ def train(opt):
   
     optimizer = optim.Adam( model.parameters(),lr=opt["lr"],weight_decay = opt["weight_decay"])      
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer,step_size = opt["lr_step"])
-    
+    opt["split"] = "train"
     train_dataset = VideoDataSet(opt,subset="train")      
     test_dataset = VideoDataSet(opt,subset=opt['inference_subset'])
     
@@ -366,7 +366,7 @@ def test(opt):
     base_dict=checkpoint['state_dict']
     model.load_state_dict(base_dict)
     model.eval()
-    
+    opt["split"] = "test"
     dataset = VideoDataSet(opt,subset=opt['inference_subset'])
     
     cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model,dataset)
