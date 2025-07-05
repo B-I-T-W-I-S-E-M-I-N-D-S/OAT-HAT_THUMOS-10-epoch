@@ -207,7 +207,7 @@ def make_dataset(opt):
     base_dict=checkpoint['state_dict']
     model.load_state_dict(base_dict)
     model.eval()
-    
+    opt["split"] = "test"
     dataset = VideoDataSet(opt,subset=opt['inference_subset'])
     
     _, _, _, output_cls, output_reg, labels_cls, labels_reg, _, _ = eval_frame(opt, model,dataset)
