@@ -116,11 +116,11 @@ def parse_opt():
     parser.add_argument(
         '--epoch',
         type=int,
-        default=10)
+        default=5)
     parser.add_argument(
         '--lr_step',
         type=int,
-        default=5)
+        default=3)
         
     # Post processing
     parser.add_argument(
