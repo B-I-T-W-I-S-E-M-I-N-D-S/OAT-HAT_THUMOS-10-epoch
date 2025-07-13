@@ -970,10 +970,30 @@ import torch.nn as nn
 from torch.nn import init
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, emb_size: int, dropout: float = 0.1, maxlen: int = 750):
+    def __init__(self,
+                 emb_size: int,
+                 dropout: float = 0.1,
+                 maxlen: int = 750):
         super(PositionalEncoding, self).__init__()
-        # Pre-compute positional encodings for efficiency
-        den = torch.exp(-torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
+        den = torch.exp(- torch.arange(0, emb_size, 2)* math.log(10000) / emb_size)
+        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+        pos_embedding = torch.zeros((maxlen, emb_size))
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        pos_embedding = pos_embedding.unsqueeze(-2)
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer('pos_embedding', pos_embedding)
+
+    def forward(self, token_embedding: torch.Tensor):
+        return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
+
+class PositionalEncoding(nn.Module):
+    def __init__(self,
+                 emb_size: int,
+                 dropout: float = 0.1,
+                 maxlen: int = 750):
+        super(PositionalEncoding, self).__init__()
+        den = torch.exp(- torch.arange(0, emb_size, 2)* math.log(10000) / emb_size)
         pos = torch.arange(0, maxlen).reshape(maxlen, 1)
         pos_embedding = torch.zeros((maxlen, emb_size))
         pos_embedding[:, 0::2] = torch.sin(pos * den)
@@ -986,539 +1006,947 @@ class PositionalEncoding(nn.Module):
         return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
 
 
-class EfficientSelfAttention(nn.Module):
-    """Optimized self-attention with optional linear complexity approximation"""
-    
-    def __init__(self, embed_dim, num_heads, dropout=0.1, max_seq_len=200):
-        super(EfficientSelfAttention, self).__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.max_seq_len = max_seq_len
-        
-        # Combined QKV projection for efficiency
-        self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        
-        # Linear attention approximation parameters
-        self.use_linear_attention = False
-        self.projection_dim = min(64, embed_dim // 4)
-        self.feature_map = nn.Sequential(
-            nn.Linear(self.head_dim, self.projection_dim),
-            nn.ReLU()
-        )
-        
-    def forward(self, x, use_linear=None):
-        seq_len, batch_size, embed_dim = x.shape
-        
-        # Decide whether to use linear attention based on sequence length
-        if use_linear is None:
-            use_linear = seq_len > self.max_seq_len
-        
-        # Project to Q, K, V
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        
-        # Reshape for multi-head attention
-        q = q.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 2)
-        k = k.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 2)
-        v = v.view(seq_len, batch_size, self.num_heads, self.head_dim).transpose(0, 2)
-        
-        if use_linear:
-            # Linear attention O(n) complexity
-            attn_output = self._linear_attention(q, k, v)
-        else:
-            # Standard attention O(n^2) complexity
-            attn_output = self._standard_attention(q, k, v)
-        
-        # Reshape and project output
-        attn_output = attn_output.transpose(0, 2).contiguous().view(seq_len, batch_size, embed_dim)
-        return self.out_proj(attn_output)
-    
-    def _standard_attention(self, q, k, v):
-        # Standard scaled dot-product attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        return torch.matmul(attn_weights, v)
-    
-    def _linear_attention(self, q, k, v):
-        # Linear attention approximation
-        num_heads, batch_size, seq_len, head_dim = q.shape
-        
-        # Apply feature map
-        q_prime = self.feature_map(q.reshape(-1, head_dim)).view(num_heads, batch_size, seq_len, -1)
-        k_prime = self.feature_map(k.reshape(-1, head_dim)).view(num_heads, batch_size, seq_len, -1)
-        
-        # Compute linear attention
-        kv = torch.matmul(k_prime.transpose(-2, -1), v)
-        qkv = torch.matmul(q_prime, kv)
-        
-        # Normalize
-        q_sum = q_prime.sum(dim=-2, keepdim=True)
-        k_sum = k_prime.sum(dim=-2, keepdim=True)
-        normalizer = torch.matmul(q_prime, k_sum.transpose(-2, -1))
-        
-        return qkv / (normalizer + 1e-8)
-
-
-class OptimizedSequenceProcessor(nn.Module):
-    """Streamlined sequence processor with reduced computational overhead"""
-    
-    def __init__(self, embedding_dim, num_heads, dropout, max_span=128):
-        super(OptimizedSequenceProcessor, self).__init__()
+class AdaptiveSequenceProcessor(nn.Module):
+    """
+    Unified sequence processor that adapts to both short and long sequences.
+    """
+    def __init__(self, embedding_dim, num_heads, dropout, max_span=200, min_span=8):
+        super(AdaptiveSequenceProcessor, self).__init__()
         self.embedding_dim = embedding_dim
         self.num_heads = num_heads
         self.max_span = max_span
+        self.min_span = min_span
         
-        # Simplified attention mechanisms
-        self.attention = EfficientSelfAttention(embedding_dim, num_heads, dropout)
+        # Sequence length thresholds
+        self.short_threshold = 16
+        self.long_threshold = 64
         
-        # Lightweight span predictor
+        # Short sequence processing (optimized for speed)
+        self.short_attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=min(num_heads, 4),
+            dropout=dropout,
+            batch_first=False
+        )
+        
+        # Long sequence processing (dual-range attention)
+        self.local_attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads // 2,
+            dropout=dropout,
+            batch_first=False
+        )
+        self.global_attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads // 2,
+            dropout=dropout,
+            batch_first=False
+        )
+        
+        # Adaptive span prediction
         self.span_predictor = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 4),
+            nn.Linear(embedding_dim, embedding_dim // 2),
             nn.GELU(),
-            nn.Linear(embedding_dim // 4, 1),
+            nn.Linear(embedding_dim // 2, 3),  # short, local, global
+            nn.Softmax(dim=-1)
+        )
+        
+        # Relevance scoring for long sequences
+        self.relevance_scorer = nn.Sequential(
+            nn.Linear(embedding_dim * 2, embedding_dim // 2),
+            nn.GELU(),
+            nn.Linear(embedding_dim // 2, 1),
             nn.Sigmoid()
         )
         
-        # Efficient feature processing
-        self.feature_processor = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
+        # Temporal decay parameters
+        self.temporal_decay_local = nn.Parameter(torch.tensor(0.9))
+        self.temporal_decay_global = nn.Parameter(torch.tensor(0.8))
+        
+        # Feature fusion
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(embedding_dim * 2, embedding_dim),
             nn.GELU(),
-            nn.LayerNorm(embedding_dim),
-            nn.Dropout(dropout * 0.5)
+            nn.LayerNorm(embedding_dim)
+        )
+        
+        # Adaptive gating
+        self.adaptive_gate = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.Sigmoid()
         )
         
         self.layer_norm = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(dropout)
         
-    def forward(self, features):
+    def forward(self, features, memory_bank=None):
+        """
+        Adaptive forward pass that switches between short and long processing.
+        
+        Args:
+            features: Current sequence features [seq_len, batch, dim]
+            memory_bank: Optional long-term memory for very long sequences
+        """
         seq_len, batch_size, dim = features.shape
         
-        # Apply attention
-        attended_features = self.attention(features, use_linear=(seq_len > 64))
+        # Determine processing mode based on sequence length
+        if seq_len <= self.short_threshold:
+            return self._process_short_sequence(features)
+        elif seq_len <= self.long_threshold:
+            return self._process_medium_sequence(features)
+        else:
+            return self._process_long_sequence(features, memory_bank)
+    
+    def _process_short_sequence(self, features):
+        """Fast processing for short sequences."""
+        seq_len, batch_size, dim = features.shape
         
-        # Process features
-        processed_features = self.feature_processor(attended_features)
+        # Simple self-attention
+        attended_features, attention_weights = self.short_attention(
+            features, features, features
+        )
+        
+        # Apply gating
+        gate_weights = self.adaptive_gate(attended_features)
+        output = attended_features * gate_weights
         
         # Residual connection and normalization
-        output = self.layer_norm(processed_features + features)
+        output = self.layer_norm(output + features)
+        
+        return output, attention_weights.mean(dim=1), []
+    
+    def _process_medium_sequence(self, features):
+        """Balanced processing for medium sequences."""
+        seq_len, batch_size, dim = features.shape
+        
+        # Compute context for span prediction
+        context = torch.mean(features, dim=0)
+        span_weights = self.span_predictor(context)
+        
+        # Local attention on recent portion
+        local_span = min(self.min_span * 2, features.shape[0])
+        local_features = features[-local_span:]
+        local_attended, local_attn = self.local_attention(
+            local_features, local_features, local_features
+        )
+        
+        # Global attention on subsampled sequence
+        if features.shape[0] > 16:
+            step = max(1, features.shape[0] // 16)
+            global_features = features[::step]
+            global_attended, global_attn = self.global_attention(
+                global_features, global_features, global_features
+            )
+            
+            # Upsample global features
+            global_upsampled = global_attended.repeat_interleave(step, dim=0)
+            if global_upsampled.shape[0] > features.shape[0]:
+                global_upsampled = global_upsampled[:features.shape[0]]
+            elif global_upsampled.shape[0] < features.shape[0]:
+                padding = features.shape[0] - global_upsampled.shape[0]
+                global_upsampled = torch.cat([
+                    global_upsampled,
+                    global_upsampled[-padding:]
+                ], dim=0)
+        else:
+            global_upsampled = local_attended
+        
+        # Extend local features to match sequence length
+        local_extended = torch.cat([
+            features[:-local_span],
+            local_attended
+        ], dim=0)
+        
+        # Weighted combination
+        combined = torch.cat([local_extended, global_upsampled], dim=-1)
+        fused_features = self.feature_fusion(combined)
+        
+        # Apply adaptive gating
+        gate_weights = self.adaptive_gate(fused_features)
+        output = fused_features * gate_weights
+        
+        # Residual connection and normalization
+        output = self.layer_norm(output + features)
+        
+        attention_weights = torch.ones(seq_len, batch_size, device=features.device)
+        return output, attention_weights, [local_span]
+    
+    def _process_long_sequence(self, features, memory_bank=None):
+        """Comprehensive processing for long sequences."""
+        seq_len, batch_size, dim = features.shape
+        
+        # Compute adaptive spans
+        context = torch.mean(features, dim=0)
+        span_weights = self.span_predictor(context)
+        
+        # Process each batch separately for efficiency
+        local_features = []
+        global_features = []
+        
+        for b in range(batch_size):
+            # Local processing
+            local_span = min(self.min_span * 4, seq_len)
+            local_history = features[-local_span:, b:b+1, :]
+            
+            if local_history.shape[0] > 0:
+                local_context = context[b:b+1, :].unsqueeze(0).expand(local_history.shape[0], -1, -1)
+                local_combined = torch.cat([local_history, local_context], dim=-1)
+                local_scores = self.relevance_scorer(local_combined).squeeze(-1).squeeze(-1)
+                
+                # Apply temporal decay
+                local_positions = torch.arange(local_history.shape[0], device=features.device, dtype=torch.float)
+                local_decay = self.temporal_decay_local ** (local_history.shape[0] - 1 - local_positions)
+                local_weights = F.softmax(local_scores + torch.log(local_decay + 1e-8), dim=0)
+                
+                local_feat = (local_history.squeeze(1) * local_weights.unsqueeze(-1)).sum(dim=0)
+            else:
+                local_feat = torch.zeros(self.embedding_dim, device=features.device)
+            
+            # Global processing (subsampled)
+            if seq_len > 32:
+                step = max(1, seq_len // 32)
+                global_history = features[::step, b:b+1, :]
+            else:
+                global_history = features[:, b:b+1, :]
+            
+            if global_history.shape[0] > 0:
+                global_context = context[b:b+1, :].unsqueeze(0).expand(global_history.shape[0], -1, -1)
+                global_combined = torch.cat([global_history, global_context], dim=-1)
+                global_scores = self.relevance_scorer(global_combined).squeeze(-1).squeeze(-1)
+                
+                global_positions = torch.arange(global_history.shape[0], device=features.device, dtype=torch.float)
+                global_decay = self.temporal_decay_global ** (global_history.shape[0] - 1 - global_positions)
+                global_weights = F.softmax(global_scores + torch.log(global_decay + 1e-8), dim=0)
+                
+                global_feat = (global_history.squeeze(1) * global_weights.unsqueeze(-1)).sum(dim=0)
+            else:
+                global_feat = torch.zeros(self.embedding_dim, device=features.device)
+            
+            local_features.append(local_feat)
+            global_features.append(global_feat)
+        
+        # Combine features
+        local_stack = torch.stack(local_features, dim=0)
+        global_stack = torch.stack(global_features, dim=0)
+        
+        # Weighted combination based on predicted spans
+        combined = torch.cat([
+            local_stack * span_weights[:, 1:2],  # local weight
+            global_stack * span_weights[:, 2:3]  # global weight
+        ], dim=-1)
+        
+        # Fusion and expansion to sequence length
+        fused = self.feature_fusion(combined)
+        fused_expanded = fused.unsqueeze(0).expand(seq_len, -1, -1)
+        
+        # Apply adaptive gating
+        gate_weights = self.adaptive_gate(fused_expanded)
+        output = fused_expanded * gate_weights
+        
+        # Residual connection and normalization
+        output = self.layer_norm(output + features)
+        
+        attention_weights = torch.ones(seq_len, batch_size, device=features.device) / seq_len
+        actual_spans = [local_span, min(self.max_span, seq_len)]
+        
+        return output, attention_weights, actual_spans
+
+
+class HierarchicalContextEncoder(nn.Module):
+    """
+    Adaptive hierarchical encoder that scales with sequence length.
+    """
+    def __init__(self, embedding_dim, num_heads, dropout):
+        super(HierarchicalContextEncoder, self).__init__()
+        
+        # Multi-scale encoders
+        self.fine_encoder = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, 
+            nhead=num_heads, 
+            dropout=dropout, 
+            activation='gelu',
+            batch_first=False
+        )
+        
+        self.coarse_encoder = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, 
+            nhead=max(1, num_heads // 2), 
+            dropout=dropout, 
+            activation='gelu',
+            batch_first=False
+        )
+        
+        # Adaptive scale fusion
+        self.scale_fusion = nn.Sequential(
+            nn.Linear(embedding_dim * 2, embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(embedding_dim)
+        )
+        
+        # Temporal consistency
+        self.temporal_consistency = nn.Conv1d(embedding_dim, embedding_dim, kernel_size=3, padding=1)
+        
+        # Adaptive feature selection
+        self.feature_selector = nn.Sequential(
+            nn.Linear(embedding_dim * 2, embedding_dim // 2),
+            nn.GELU(),
+            nn.Linear(embedding_dim // 2, 2),
+            nn.Softmax(dim=-1)
+        )
+        
+        self.layer_norm = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, features, sequence_length_ratio=1.0):
+        """
+        Adaptive forward pass based on sequence characteristics.
+        
+        Args:
+            features: Input features [seq_len, batch, dim]
+            sequence_length_ratio: Ratio indicating sequence complexity
+        """
+        seq_len, batch_size, dim = features.shape
+        
+        # Fine-grained processing
+        fine_features = self.fine_encoder(features)
+        
+        # Coarse-grained processing (adaptive based on sequence length)
+        if seq_len >= 8 and sequence_length_ratio > 0.5:
+            # Adaptive downsampling
+            downsample_factor = min(4, max(2, seq_len // 16))
+            coarse_features = features.permute(1, 2, 0)  # [batch, dim, seq]
+            coarse_features = F.avg_pool1d(
+                coarse_features, 
+                kernel_size=downsample_factor, 
+                stride=downsample_factor, 
+                padding=0
+            )
+            coarse_features = coarse_features.permute(2, 0, 1)  # [seq//factor, batch, dim]
+            
+            # Encode coarse features
+            coarse_encoded = self.coarse_encoder(coarse_features)
+            
+            # Upsample back to original length
+            coarse_upsampled = coarse_encoded.permute(1, 2, 0)  # [batch, dim, seq//factor]
+            coarse_upsampled = F.interpolate(
+                coarse_upsampled, 
+                size=seq_len, 
+                mode='linear', 
+                align_corners=False
+            )
+            coarse_upsampled = coarse_upsampled.permute(2, 0, 1)  # [seq, batch, dim]
+        else:
+            # For short sequences, use fine features as coarse
+            coarse_upsampled = fine_features
+        
+        # Adaptive feature selection
+        combined_for_selection = torch.cat([fine_features, coarse_upsampled], dim=-1)
+        selection_weights = self.feature_selector(combined_for_selection)
+        
+        # Weighted combination
+        selected_features = (fine_features * selection_weights[:, :, 0:1] + 
+                           coarse_upsampled * selection_weights[:, :, 1:2])
+        
+        # Temporal consistency (adaptive kernel size)
+        if seq_len > 16:
+            consistency_features = selected_features.permute(1, 2, 0)  # [batch, dim, seq]
+            consistency_features = self.temporal_consistency(consistency_features)
+            consistency_features = consistency_features.permute(2, 0, 1)  # [seq, batch, dim]
+            
+            # Fusion
+            fused_features = self.scale_fusion(torch.cat([selected_features, consistency_features], dim=-1))
+        else:
+            fused_features = selected_features
+        
+        # Final normalization
+        output = self.layer_norm(fused_features)
+        output = self.dropout(output)
         
         return output
 
 
-class TwoStageClassifier(nn.Module):
-    """Two-stage classifier for better action localization"""
-    
-    def __init__(self, embedding_dim, num_classes, dropout=0.1):
-        super(TwoStageClassifier, self).__init__()
+class InstanceDecodingModule(nn.Module):
+    """
+    Instance decoding module that generates refined instance queries through cross-attention.
+    """
+    def __init__(self, embedding_dim, num_heads, num_instances, dropout=0.1):
+        super(InstanceDecodingModule, self).__init__()
         self.embedding_dim = embedding_dim
-        self.num_classes = num_classes
+        self.num_heads = num_heads
+        self.num_instances = num_instances
         
-        # Stage 1: Coarse classification (action vs background)
-        self.stage1_classifier = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 2),
-            nn.GELU(),
-            nn.BatchNorm1d(embedding_dim // 2),
-            nn.Dropout(dropout),
-            nn.Linear(embedding_dim // 2, 2)  # action vs background
+        # Learnable instance queries
+        self.instance_queries = nn.Parameter(torch.randn(num_instances, embedding_dim))
+        
+        # Instance-specific cross-attention layers
+        self.cross_attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=embedding_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=False
+            ) for _ in range(2)  # Two layers for better refinement
+        ])
+        
+        # Self-attention for query interaction
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=False
         )
         
-        # Stage 2: Fine-grained action classification
-        self.stage2_classifier = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 2),
+        # Feed-forward networks for each cross-attention layer
+        self.ffn_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim * 4),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embedding_dim * 4, embedding_dim),
+                nn.Dropout(dropout)
+            ) for _ in range(2)
+        ])
+        
+        # Layer normalization
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(embedding_dim) for _ in range(5)  # 2 cross-attn + 2 ffn + 1 self-attn
+        ])
+        
+        # Query enhancement network
+        self.query_enhancer = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
             nn.GELU(),
-            nn.BatchNorm1d(embedding_dim // 2),
-            nn.Dropout(dropout),
-            nn.Linear(embedding_dim // 2, num_classes)
+            nn.LayerNorm(embedding_dim),
+            nn.Dropout(dropout)
         )
         
-        # Confidence predictor for stage 2
-        self.confidence_predictor = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 4),
+        # Contextual gating for adaptive feature selection
+        self.contextual_gate = nn.Sequential(
+            nn.Linear(embedding_dim * 2, embedding_dim),
             nn.GELU(),
-            nn.Linear(embedding_dim // 4, 1),
+            nn.Linear(embedding_dim, embedding_dim),
             nn.Sigmoid()
         )
         
-        # Feature refinement for stage 2
-        self.feature_refiner = nn.Sequential(
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, encoded_features, sequence_context=None):
+        """
+        Forward pass of instance decoding module.
+        
+        Args:
+            encoded_features: Encoded sequence features [seq_len, batch, dim]
+            sequence_context: Optional global sequence context [batch, dim]
+        
+        Returns:
+            refined_queries: Refined instance queries [num_instances, batch, dim]
+            attention_weights: Attention weights for interpretability
+        """
+        seq_len, batch_size, dim = encoded_features.shape
+        
+        # Initialize instance queries for current batch
+        instance_queries = self.instance_queries.unsqueeze(1).expand(-1, batch_size, -1)
+        
+        # Store attention weights for interpretability
+        attention_weights = []
+        
+        # Cross-attention refinement layers
+        for i, (cross_attn, ffn, norm1, norm2) in enumerate(
+            zip(self.cross_attention_layers, self.ffn_layers, 
+                self.layer_norms[::2], self.layer_norms[1::2])
+        ):
+            # Cross-attention: queries attend to encoded features
+            refined_queries, attn_weights = cross_attn(
+                query=instance_queries,
+                key=encoded_features,
+                value=encoded_features
+            )
+            
+            # Residual connection and normalization
+            instance_queries = norm1(instance_queries + self.dropout(refined_queries))
+            
+            # Feed-forward network
+            ffn_output = ffn(instance_queries)
+            instance_queries = norm2(instance_queries + ffn_output)
+            
+            attention_weights.append(attn_weights)
+        
+        # Self-attention for query interaction
+        self_attended_queries, self_attn_weights = self.self_attention(
+            query=instance_queries,
+            key=instance_queries,
+            value=instance_queries
+        )
+        
+        # Residual connection and normalization
+        instance_queries = self.layer_norms[4](instance_queries + self.dropout(self_attended_queries))
+        attention_weights.append(self_attn_weights)
+        
+        # Query enhancement
+        enhanced_queries = self.query_enhancer(instance_queries)
+        
+        # Contextual gating if sequence context is provided
+        if sequence_context is not None:
+            # Expand context to match query dimensions
+            context_expanded = sequence_context.unsqueeze(0).expand(self.num_instances, -1, -1)
+            
+            # Compute gating weights
+            gate_input = torch.cat([enhanced_queries, context_expanded], dim=-1)
+            gate_weights = self.contextual_gate(gate_input)
+            
+            # Apply gating
+            refined_queries = enhanced_queries * gate_weights
+        else:
+            refined_queries = enhanced_queries
+        
+        return refined_queries, attention_weights
+
+
+class QueryRefiningModule(nn.Module):
+    """
+    Query refining module that further enhances instance queries with contextual information.
+    """
+    def __init__(self, embedding_dim, num_heads, dropout=0.1):
+        super(QueryRefiningModule, self).__init__()
+        self.embedding_dim = embedding_dim
+        
+        # Multi-scale feature extraction
+        self.multi_scale_conv = nn.ModuleList([
+            nn.Conv1d(embedding_dim, embedding_dim // 4, kernel_size=k, padding=k//2)
+            for k in [1, 3, 5, 7]
+        ])
+        
+        # Feature fusion after multi-scale processing
+        self.feature_fusion = nn.Sequential(
             nn.Linear(embedding_dim, embedding_dim),
             nn.GELU(),
             nn.LayerNorm(embedding_dim)
         )
         
-    def forward(self, features):
-        # features: [batch, num_anchors, embedding_dim]
-        batch_size, num_anchors, embedding_dim = features.shape
+        # Attention-based query refinement
+        self.query_refiner = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=False
+        )
         
-        # FIXED: Use reshape instead of view to handle non-contiguous tensors
-        features_flat = features.reshape(-1, embedding_dim)
-        
-        # Stage 1: Coarse classification
-        stage1_logits = self.stage1_classifier(features_flat)
-        stage1_probs = F.softmax(stage1_logits, dim=-1)
-        
-        # Get action probability from stage 1
-        action_prob = stage1_probs[:, 1]  # probability of being an action
-        
-        # Stage 2: Fine-grained classification with gating
-        refined_features = self.feature_refiner(features_flat)
-        stage2_logits = self.stage2_classifier(refined_features)
-        
-        # Confidence gating
-        confidence = self.confidence_predictor(refined_features).squeeze(-1)
-        
-        # Combine stages with confidence weighting
-        # Higher confidence in stage 2 when stage 1 predicts action
-        combined_confidence = action_prob * confidence
-        
-        # Reshape outputs
-        stage1_output = stage1_logits.view(batch_size, num_anchors, 2)
-        stage2_output = stage2_logits.view(batch_size, num_anchors, self.num_classes)
-        confidence_output = combined_confidence.view(batch_size, num_anchors, 1)
-        
-        return stage1_output, stage2_output, confidence_output
-
-
-class EnhancedRegressor(nn.Module):
-    """Enhanced regression head with boundary refinement"""
-    
-    def __init__(self, embedding_dim, dropout=0.1):
-        super(EnhancedRegressor, self).__init__()
-        
-        # Main regression head
-        self.main_regressor = nn.Sequential(
+        # Adaptive importance weighting
+        self.importance_network = nn.Sequential(
             nn.Linear(embedding_dim, embedding_dim // 2),
             nn.GELU(),
-            nn.BatchNorm1d(embedding_dim // 2),
-            nn.Dropout(dropout),
-            nn.Linear(embedding_dim // 2, 2)  # start, end offsets
-        )
-        
-        # Boundary refinement head
-        self.boundary_refiner = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 4),
-            nn.GELU(),
-            nn.Linear(embedding_dim // 4, 2),  # boundary adjustment
-            nn.Tanh()  # bounded adjustments
-        )
-        
-        # Quality predictor for regression
-        self.quality_predictor = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim // 4),
-            nn.GELU(),
-            nn.Linear(embedding_dim // 4, 1),
+            nn.Linear(embedding_dim // 2, 1),
             nn.Sigmoid()
         )
         
-    def forward(self, features):
-        # features: [batch, num_anchors, embedding_dim]
-        batch_size, num_anchors, embedding_dim = features.shape
+        # Final refinement network
+        self.final_refiner = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(embedding_dim),
+            nn.Dropout(dropout)
+        )
         
-        # FIXED: Use reshape instead of view to handle non-contiguous tensors
-        features_flat = features.reshape(-1, embedding_dim)
+        self.layer_norm = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(dropout)
         
-        # Main regression
-        main_reg = self.main_regressor(features_flat)
+    def forward(self, instance_queries, encoded_features):
+        """
+        Refine instance queries using contextual information.
         
-        # Boundary refinement
-        boundary_adj = self.boundary_refiner(features_flat) * 0.1  # small adjustments
+        Args:
+            instance_queries: Instance queries [num_instances, batch, dim]
+            encoded_features: Encoded sequence features [seq_len, batch, dim]
         
-        # Quality prediction
-        quality = self.quality_predictor(features_flat)
+        Returns:
+            refined_queries: Further refined queries [num_instances, batch, dim]
+        """
+        num_instances, batch_size, dim = instance_queries.shape
+        seq_len = encoded_features.shape[0]
         
-        # Combine main regression with boundary refinement
-        refined_reg = main_reg + boundary_adj
+        # Multi-scale feature extraction from encoded features
+        # Reshape for conv1d: [batch, dim, seq_len]
+        conv_input = encoded_features.permute(1, 2, 0)
         
-        # Reshape outputs
-        regression_output = refined_reg.view(batch_size, num_anchors, 2)
-        quality_output = quality.view(batch_size, num_anchors, 1)
+        multi_scale_features = []
+        for conv_layer in self.multi_scale_conv:
+            scale_features = conv_layer(conv_input)
+            multi_scale_features.append(scale_features)
         
-        return regression_output, quality_output
+        # Concatenate and reshape back
+        multi_scale_concat = torch.cat(multi_scale_features, dim=1)  # [batch, dim, seq_len]
+        multi_scale_features = multi_scale_concat.permute(2, 0, 1)  # [seq_len, batch, dim]
+        
+        # Feature fusion
+        fused_features = self.feature_fusion(multi_scale_features)
+        
+        # Query refinement through cross-attention
+        refined_queries, _ = self.query_refiner(
+            query=instance_queries,
+            key=fused_features,
+            value=fused_features
+        )
+        
+        # Compute importance weights for each query
+        importance_weights = self.importance_network(refined_queries)
+        
+        # Apply importance weighting
+        weighted_queries = refined_queries * importance_weights
+        
+        # Final refinement
+        final_queries = self.final_refiner(weighted_queries)
+        
+        # Residual connection and normalization
+        output = self.layer_norm(instance_queries + self.dropout(final_queries))
+        
+        return output
 
 
 class MYNET(torch.nn.Module):
     def __init__(self, opt):
         super(MYNET, self).__init__()
-        self.n_feature = opt["feat_dim"]
+        self.n_feature = opt["feat_dim"] 
         n_class = opt["num_of_class"]
         n_embedding_dim = opt["hidden_dim"]
-        n_enc_layer = min(opt["enc_layer"], 4)  # Limit encoder layers for speed
+        n_enc_layer = opt["enc_layer"]
         n_enc_head = opt["enc_head"]
-        n_dec_layer = min(opt["dec_layer"], 2)  # Limit decoder layers for speed
+        n_dec_layer = opt["dec_layer"]
         n_dec_head = opt["dec_head"]
+        n_seglen = opt["segment_size"]
         self.anchors = opt["anchors"]
-        dropout = 0.2  # Reduced dropout for faster training
-        
+        self.anchors_stride = []
+        dropout = 0.3
         self.best_loss = 1000000
         self.best_map = 0
         
-        # Sequence length thresholds
+        # Sequence length thresholds for adaptive processing
+        self.short_threshold = 16
         self.medium_threshold = 64
         self.long_threshold = 128
         
-        # Optimized feature reduction with shared weights
-        self.feature_reduction = nn.Sequential(
-            nn.Linear(self.n_feature, n_embedding_dim),
+        # Enhanced feature reduction with normalization
+        self.feature_reduction_rgb = nn.Sequential(
+            nn.Linear(self.n_feature//2, n_embedding_dim//2),
             nn.GELU(),
-            nn.LayerNorm(n_embedding_dim),
+            nn.LayerNorm(n_embedding_dim//2),
+            nn.Dropout(dropout * 0.5)
+        )
+        self.feature_reduction_flow = nn.Sequential(
+            nn.Linear(self.n_feature//2, n_embedding_dim//2),
+            nn.GELU(),
+            nn.LayerNorm(n_embedding_dim//2),
             nn.Dropout(dropout * 0.5)
         )
         
-        self.positional_encoding = PositionalEncoding(n_embedding_dim, dropout, maxlen=300)
+        self.positional_encoding = PositionalEncoding(n_embedding_dim, dropout, maxlen=400)
         
-        # Optimized sequence processor
-        self.sequence_processor = OptimizedSequenceProcessor(
+        # Unified adaptive sequence processor
+        self.adaptive_processor = AdaptiveSequenceProcessor(
             embedding_dim=n_embedding_dim,
             num_heads=n_enc_head,
             dropout=dropout,
-            max_span=128
+            max_span=200,
+            min_span=8
         )
         
-        # Simplified encoder with fewer layers
+        # Hierarchical context encoder
+        self.hierarchical_encoder = HierarchicalContextEncoder(
+            embedding_dim=n_embedding_dim,
+            num_heads=n_enc_head,
+            dropout=dropout
+        )
+        
+        # Main encoder (adaptive layers based on sequence complexity)
         self.encoder_layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=n_embedding_dim,
-                nhead=n_enc_head,
-                dim_feedforward=n_embedding_dim * 2,  # Reduced from 4x
-                dropout=dropout,
-                activation='gelu',
-                batch_first=False
+                d_model=n_embedding_dim, 
+                nhead=n_enc_head, 
+                dropout=dropout, 
+                activation='gelu'
             ) for _ in range(n_enc_layer)
         ])
         self.encoder_norm = nn.LayerNorm(n_embedding_dim)
         
-        # Simplified decoder
+        # Instance decoding module
+        self.instance_decoder = InstanceDecodingModule(
+            embedding_dim=n_embedding_dim,
+            num_heads=n_dec_head,
+            num_instances=len(self.anchors),
+            dropout=dropout
+        )
+        
+        # Query refining module
+        self.query_refiner = QueryRefiningModule(
+            embedding_dim=n_embedding_dim,
+            num_heads=n_dec_head,
+            dropout=dropout
+        )
+        
+        # Decoder
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
-                d_model=n_embedding_dim,
-                nhead=n_dec_head,
-                dim_feedforward=n_embedding_dim * 2,  # Reduced from 4x
-                dropout=dropout,
-                activation='gelu',
-                batch_first=False
-            ),
-            n_dec_layer,
+                d_model=n_embedding_dim, 
+                nhead=n_dec_head, 
+                dropout=dropout, 
+                activation='gelu'
+            ), 
+            n_dec_layer, 
             nn.LayerNorm(n_embedding_dim)
         )
         
-        # Two-stage classifier
-        self.two_stage_classifier = TwoStageClassifier(
-            embedding_dim=n_embedding_dim,
-            num_classes=n_class,
-            dropout=dropout
+        # Context integration
+        self.context_integration = nn.Sequential(
+            nn.Linear(n_embedding_dim * 2, n_embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(n_embedding_dim)
         )
         
-        # Enhanced regressor
-        self.enhanced_regressor = EnhancedRegressor(
-            embedding_dim=n_embedding_dim,
-            dropout=dropout
+        # Global context extractor for sequence-level information
+        self.global_context_extractor = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(n_embedding_dim, n_embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(n_embedding_dim)
         )
         
-        # Learnable decoder tokens
+        # Enhanced classification and regression heads with residual connections
+        self.classifier = nn.Sequential(
+            nn.Linear(n_embedding_dim, n_embedding_dim), 
+            nn.GELU(), 
+            nn.LayerNorm(n_embedding_dim),
+            nn.Dropout(dropout),
+            nn.Linear(n_embedding_dim, n_embedding_dim // 2),
+            nn.GELU(),
+            nn.Linear(n_embedding_dim // 2, n_class)
+        )
+        self.regressor = nn.Sequential(
+            nn.Linear(n_embedding_dim, n_embedding_dim), 
+            nn.GELU(), 
+            nn.LayerNorm(n_embedding_dim),
+            nn.Dropout(dropout),
+            nn.Linear(n_embedding_dim, n_embedding_dim // 2),
+            nn.GELU(),
+            nn.Linear(n_embedding_dim // 2, 2)
+        )
+        
+        # Backup decoder token (for compatibility)
         self.decoder_token = nn.Parameter(torch.zeros(len(self.anchors), 1, n_embedding_dim))
-        nn.init.normal_(self.decoder_token, std=0.02)
         
-        # Normalization layers
+        # Additional normalization layers
         self.norm1 = nn.LayerNorm(n_embedding_dim)
         self.norm2 = nn.LayerNorm(n_embedding_dim)
+        self.norm3 = nn.LayerNorm(n_embedding_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
         
-        # Initialize weights
-        self.apply(self._init_weights)
-        
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-    
+        self.relu = nn.ReLU(True)
+        self.softmaxd1 = nn.Softmax(dim=-1)
+
     def forward(self, inputs):
         # Enhanced feature processing
         inputs = inputs.float()
+        base_x_rgb = self.feature_reduction_rgb(inputs[:,:,:self.n_feature//2])
+        base_x_flow = self.feature_reduction_flow(inputs[:,:,self.n_feature//2:])
+        base_x = torch.cat([base_x_rgb, base_x_flow], dim=-1)
         
-        # Unified feature reduction instead of separate RGB/flow
-        base_x = self.feature_reduction(inputs)
-        base_x = base_x.permute([1, 0, 2])  # seq_len x batch x featsize
+        base_x = base_x.permute([1,0,2])  # seq_len x batch x featsize
         seq_len = base_x.shape[0]
         
         # Apply positional encoding
         pe_x = self.positional_encoding(base_x)
         
-        # Optimized sequence processing
-        processed_features = self.sequence_processor(pe_x)
+        # Determine sequence complexity ratio
+        sequence_length_ratio = min(1.0, seq_len / self.long_threshold)
         
-        # Adaptive encoder processing based on sequence length
-        encoded_x = processed_features
+        # Adaptive processing based on sequence length
+        if seq_len <= self.short_threshold:
+            # Short sequence: Fast processing
+            processed_features, _, _ = self.adaptive_processor(pe_x)
+            
+            # Minimal encoder layers for short sequences
+            encoded_x = processed_features
+            for i in range(min(2, len(self.encoder_layers))):
+                encoded_x = self.encoder_layers[i](encoded_x)
+            
+        elif seq_len <= self.medium_threshold:
+            # Medium sequence: Balanced processing
+            processed_features, _, _ = self.adaptive_processor(pe_x)
+            hierarchical_features = self.hierarchical_encoder(processed_features, sequence_length_ratio)
+            
+            # Integrate adaptive and hierarchical features
+            integrated_features = self.context_integration(
+                torch.cat([processed_features, hierarchical_features], dim=-1)
+            )
+            
+            # Standard encoder processing
+            encoded_x = integrated_features
+            for layer in self.encoder_layers:
+                encoded_x = layer(encoded_x)
+            
+        else:
+            # Long sequence: Full hierarchical processing
+            hierarchical_features = self.hierarchical_encoder(pe_x, sequence_length_ratio)
+            processed_features, _, _ = self.adaptive_processor(hierarchical_features)
+            
+            # Integrate features
+            integrated_features = self.context_integration(
+                torch.cat([hierarchical_features, processed_features], dim=-1)
+            )
+            
+            # Full encoder processing
+            encoded_x = integrated_features
+            for layer in self.encoder_layers:
+                encoded_x = layer(encoded_x)
         
-        # Use fewer encoder layers for shorter sequences
-        num_layers = len(self.encoder_layers)
-        if seq_len <= self.medium_threshold:
-            num_layers = max(1, num_layers // 2)
-        elif seq_len <= self.long_threshold:
-            num_layers = max(2, num_layers // 1.5)
-        
-        for i in range(int(num_layers)):
-            encoded_x = self.encoder_layers[i](encoded_x)
-        
-        # Apply normalization
+        # Apply encoder normalization
         encoded_x = self.encoder_norm(encoded_x)
         encoded_x = self.norm1(encoded_x)
         
-        # Decoder processing
+        # Extract global sequence context
+        # Reshape for global pooling: [batch, dim, seq_len]
+        context_input = encoded_x.permute(1, 2, 0)
+        global_context = self.global_context_extractor(context_input)  # [batch, dim]
+        
+        # Instance decoding with global context
+        instance_queries, attention_weights = self.instance_decoder(
+            encoded_x, 
+            sequence_context=global_context
+        )
+        
+        # Query refining
+        refined_queries = self.query_refiner(instance_queries, encoded_x)
+        
+        # Apply normalization after query refining
+        refined_queries = self.norm2(refined_queries)
+        
+        # Traditional decoder processing as backup/enhancement
         decoder_token = self.decoder_token.expand(-1, encoded_x.shape[1], -1)
         decoded_x = self.decoder(decoder_token, encoded_x)
-        decoded_x = self.norm2(decoded_x)
         
-        # Transpose for classification/regression
-        decoded_x = decoded_x.permute([1, 0, 2])  # batch x num_anchors x embedding_dim
+        # Combine refined queries with decoder output
+        # Use refined queries as primary, decoder output as enhancement
+        combined_features = refined_queries + self.dropout1(decoded_x)
+        combined_features = self.norm3(combined_features)
         
-        # Two-stage classification
-        stage1_cls, stage2_cls, confidence = self.two_stage_classifier(decoded_x)
+        # Convert back to batch-first format for prediction heads
+        combined_features = combined_features.permute([1, 0, 2])  # [batch, num_instances, dim]
         
-        # Enhanced regression
-        regression, quality = self.enhanced_regressor(decoded_x)
-        
-        # Combine two-stage classification for final output
-        # Weight stage2 predictions by stage1 action probability and confidence
-        stage1_probs = F.softmax(stage1_cls, dim=-1)
-        action_prob = stage1_probs[:, :, 1:2]  # [batch, num_anchors, 1]
-        
-        # Final classification: stage2 weighted by action probability and confidence
-        anc_cls = stage2_cls * action_prob * confidence
-        
-        # Enhanced regression weighted by quality
-        anc_reg = regression * quality
+        # Apply prediction heads
+        anc_cls = self.classifier(combined_features)
+        anc_reg = self.regressor(combined_features)
         
         return anc_cls, anc_reg
-
-    def get_detailed_outputs(self, inputs):
+    
+    def get_attention_weights(self, inputs):
         """
-        Alternative forward method that returns detailed outputs for analysis
-        Use this for debugging or detailed loss computation
+        Method to extract attention weights for interpretability.
         """
-        # Enhanced feature processing
-        inputs = inputs.float()
-        
-        # Unified feature reduction instead of separate RGB/flow
-        base_x = self.feature_reduction(inputs)
-        base_x = base_x.permute([1, 0, 2])  # seq_len x batch x featsize
-        seq_len = base_x.shape[0]
-        
-        # Apply positional encoding
-        pe_x = self.positional_encoding(base_x)
-        
-        # Optimized sequence processing
-        processed_features = self.sequence_processor(pe_x)
-        
-        # Adaptive encoder processing based on sequence length
-        encoded_x = processed_features
-        
-        # Use fewer encoder layers for shorter sequences
-        num_layers = len(self.encoder_layers)
-        if seq_len <= self.medium_threshold:
-            num_layers = max(1, num_layers // 2)
-        elif seq_len <= self.long_threshold:
-            num_layers = max(2, num_layers // 1.5)
-        
-        for i in range(int(num_layers)):
-            encoded_x = self.encoder_layers[i](encoded_x)
-        
-        # Apply normalization
-        encoded_x = self.encoder_norm(encoded_x)
-        encoded_x = self.norm1(encoded_x)
-        
-        # Decoder processing
-        decoder_token = self.decoder_token.expand(-1, encoded_x.shape[1], -1)
-        decoded_x = self.decoder(decoder_token, encoded_x)
-        decoded_x = self.norm2(decoded_x)
-        
-        # Transpose for classification/regression
-        decoded_x = decoded_x.permute([1, 0, 2])  # batch x num_anchors x embedding_dim
-        
-        # Two-stage classification
-        stage1_cls, stage2_cls, confidence = self.two_stage_classifier(decoded_x)
-        
-        # Enhanced regression
-        regression, quality = self.enhanced_regressor(decoded_x)
-        
-        return {
-            'stage1_cls': stage1_cls,  # [batch, num_anchors, 2] - action vs background
-            'stage2_cls': stage2_cls,  # [batch, num_anchors, num_classes] - fine-grained
-            'confidence': confidence,  # [batch, num_anchors, 1] - classification confidence
-            'regression': regression,  # [batch, num_anchors, 2] - boundary offsets
-            'quality': quality        # [batch, num_anchors, 1] - regression quality
-        }
+        with torch.no_grad():
+            # Process inputs similar to forward pass
+            inputs = inputs.float()
+            base_x_rgb = self.feature_reduction_rgb(inputs[:,:,:self.n_feature//2])
+            base_x_flow = self.feature_reduction_flow(inputs[:,:,self.n_feature//2:])
+            base_x = torch.cat([base_x_rgb, base_x_flow], dim=-1)
+            
+            base_x = base_x.permute([1,0,2])
+            seq_len = base_x.shape[0]
+            
+            pe_x = self.positional_encoding(base_x)
+            sequence_length_ratio = min(1.0, seq_len / self.long_threshold)
+            
+            # Encode features
+            if seq_len <= self.short_threshold:
+                processed_features, _, _ = self.adaptive_processor(pe_x)
+                encoded_x = processed_features
+                for i in range(min(2, len(self.encoder_layers))):
+                    encoded_x = self.encoder_layers[i](encoded_x)
+            elif seq_len <= self.medium_threshold:
+                processed_features, _, _ = self.adaptive_processor(pe_x)
+                hierarchical_features = self.hierarchical_encoder(processed_features, sequence_length_ratio)
+                integrated_features = self.context_integration(
+                    torch.cat([processed_features, hierarchical_features], dim=-1)
+                )
+                encoded_x = integrated_features
+                for layer in self.encoder_layers:
+                    encoded_x = layer(encoded_x)
+            else:
+                hierarchical_features = self.hierarchical_encoder(pe_x, sequence_length_ratio)
+                processed_features, _, _ = self.adaptive_processor(hierarchical_features)
+                integrated_features = self.context_integration(
+                    torch.cat([hierarchical_features, processed_features], dim=-1)
+                )
+                encoded_x = integrated_features
+                for layer in self.encoder_layers:
+                    encoded_x = layer(encoded_x)
+            
+            encoded_x = self.encoder_norm(encoded_x)
+            encoded_x = self.norm1(encoded_x)
+            
+            # Extract global context
+            context_input = encoded_x.permute(1, 2, 0)
+            global_context = self.global_context_extractor(context_input)
+            
+            # Get attention weights from instance decoder
+            _, attention_weights = self.instance_decoder(encoded_x, sequence_context=global_context)
+            
+            return attention_weights
+    
+    def get_instance_features(self, inputs):
+        """
+        Method to extract instance features for analysis.
+        """
+        with torch.no_grad():
+            # Similar processing as forward pass
+            inputs = inputs.float()
+            base_x_rgb = self.feature_reduction_rgb(inputs[:,:,:self.n_feature//2])
+            base_x_flow = self.feature_reduction_flow(inputs[:,:,self.n_feature//2:])
+            base_x = torch.cat([base_x_rgb, base_x_flow], dim=-1)
+            
+            base_x = base_x.permute([1,0,2])
+            seq_len = base_x.shape[0]
+            
+            pe_x = self.positional_encoding(base_x)
+            sequence_length_ratio = min(1.0, seq_len / self.long_threshold)
+            
+            # Encode features (same as forward pass)
+            if seq_len <= self.short_threshold:
+                processed_features, _, _ = self.adaptive_processor(pe_x)
+                encoded_x = processed_features
+                for i in range(min(2, len(self.encoder_layers))):
+                    encoded_x = self.encoder_layers[i](encoded_x)
+            elif seq_len <= self.medium_threshold:
+                processed_features, _, _ = self.adaptive_processor(pe_x)
+                hierarchical_features = self.hierarchical_encoder(processed_features, sequence_length_ratio)
+                integrated_features = self.context_integration(
+                    torch.cat([processed_features, hierarchical_features], dim=-1)
+                )
+                encoded_x = integrated_features
+                for layer in self.encoder_layers:
+                    encoded_x = layer(encoded_x)
+            else:
+                hierarchical_features = self.hierarchical_encoder(pe_x, sequence_length_ratio)
+                processed_features, _, _ = self.adaptive_processor(hierarchical_features)
+                integrated_features = self.context_integration(
+                    torch.cat([hierarchical_features, processed_features], dim=-1)
+                )
+                encoded_x = integrated_features
+                for layer in self.encoder_layers:
+                    encoded_x = layer(encoded_x)
+            
+            encoded_x = self.encoder_norm(encoded_x)
+            encoded_x = self.norm1(encoded_x)
+            
+            # Extract global context
+            context_input = encoded_x.permute(1, 2, 0)
+            global_context = self.global_context_extractor(context_input)
+            
+            # Get instance features
+            instance_queries, _ = self.instance_decoder(encoded_x, sequence_context=global_context)
+            refined_queries = self.query_refiner(instance_queries, encoded_x)
+            
+            return refined_queries.permute([1, 0, 2])  # [batch, num_instances, dim]
 
-
-# Example usage and training modifications
-def compute_two_stage_loss(model_outputs, cls_targets, reg_targets, stage1_weight=0.3, stage2_weight=0.7):
-    """
-    Compute loss for two-stage classification
-    
-    Args:
-        model_outputs: Dict from model.get_detailed_outputs()
-        cls_targets: Classification targets
-        reg_targets: Regression targets
-    """
-    
-    # Stage 1 loss (action vs background)
-    stage1_targets = (cls_targets > 0).long()  # Convert to binary
-    stage1_loss = F.cross_entropy(
-        model_outputs['stage1_cls'].view(-1, 2),
-        stage1_targets.view(-1)
-    )
-    
-    # Stage 2 loss (fine-grained classification)
-    # Only compute loss for action regions
-    action_mask = stage1_targets.bool()
-    if action_mask.sum() > 0:
-        stage2_loss = F.cross_entropy(
-            model_outputs['stage2_cls'][action_mask],
-            cls_targets[action_mask]
-        )
-    else:
-        stage2_loss = torch.tensor(0.0, device=cls_targets.device)
-    
-    # Confidence loss (encourage high confidence for correct predictions)
-    confidence_loss = F.mse_loss(
-        model_outputs['confidence'].squeeze(-1),
-        (model_outputs['stage1_cls'].argmax(dim=-1) == stage1_targets).float()
-    )
-    
-    return stage1_weight * stage1_loss + stage2_weight * stage2_loss + 0.1 * confidence_loss
-
-
-def compute_enhanced_regression_loss(model_outputs, reg_targets, quality_weight=0.1):
-    """
-    Compute enhanced regression loss with quality weighting
-    
-    Args:
-        model_outputs: Dict from model.get_detailed_outputs()
-        reg_targets: Regression targets
-    """
-    
-    # Main regression loss
-    regression_loss = F.smooth_l1_loss(
-        model_outputs['regression'],
-        reg_targets,
-        reduction='none'
-    )
-    
-    # Weight regression loss by predicted quality
-    quality_weights = model_outputs['quality'].squeeze(-1)
-    weighted_regression_loss = (regression_loss * quality_weights.unsqueeze(-1)).mean()
-    
-    # Quality loss (encourage high quality for accurate predictions)
-    regression_accuracy = torch.exp(-regression_loss.mean(dim=-1))
-    quality_loss = F.mse_loss(quality_weights, regression_accuracy)
-    
-    return weighted_regression_loss + quality_weight * quality_loss
- 
 class SuppressNet(torch.nn.Module):
     def __init__(self, opt):
         super(SuppressNet, self).__init__()
