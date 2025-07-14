@@ -44,8 +44,8 @@ class VideoDataSet(data.Dataset):
         self.subset = subset
         self.mode = opt["mode"]
         self.predefined_fps = opt["predefined_fps"]
-        self.video_anno_path = opt["video_anno"].format(opt["split"])          
-        self.video_len_path = opt["video_len_file"].format(self.subset+'_'+opt["setup"])        
+        self.video_anno_path = opt["video_anno"]        
+        self.video_len_path = opt["video_len_file"].format(self.subset)        
         self.num_of_class = opt["num_of_class"]
         self.segment_size = opt["segment_size"]
         self.label_name = []     
@@ -55,7 +55,6 @@ class VideoDataSet(data.Dataset):
         self.gt_action= {}
         self.cls_label={}
         self.reg_label={}
-        self.snip_label={}
         self.inputs=[]
         self.inputs_all=[]
         self.data_rescale=opt["data_rescale"]
@@ -66,8 +65,7 @@ class VideoDataSet(data.Dataset):
         self._loadFeaturelen(opt)                  
         self._getMatchScore()
         self._makeInputSeq()
-        self._loadPropLabel(opt['proposal_label_file'].format(self.subset+'_'+opt["setup"]))
-        
+        self._loadPropLabel(opt['proposal_label_file'].format(self.subset))
         if self.subset == "train":
             if opt['data_format'] == "h5":
                 feature_rgb_file = h5py.File(opt["video_feature_rgb_train"], 'r')
@@ -94,43 +92,6 @@ class VideoDataSet(data.Dataset):
                     self.feature_rgb_file[keys[vidx]]=feature_All[keys[vidx]]['rgb']#np.array(feature_All[keys[vidx]]['rgb'])
                 for vidx in range(len(keys)):
                     self.feature_flow_file[keys[vidx]]=feature_All[keys[vidx]]['flow']#np.array(feature_All[keys[vidx]]['flow'])
-            
-            elif opt['data_format'] == "npz":
-                feature_All = {}
-                self.feature_rgb_file={}
-                self.feature_flow_file={}
-                for file in self.video_list:
-                    feature_All[file] = np.load(opt["video_feature_all_train"]+file+'.npz')['feats']
-                    
-                keys = self.video_list
-                for vidx in range(len(keys)):
-                    self.feature_rgb_file[keys[vidx]]=feature_All[keys[vidx]][:]
-                self.feature_flow_file = None
-
-            elif opt['data_format'] == "npz_i3d":
-                feature_All = {}
-                self.feature_rgb_file={}
-                self.feature_flow_file={}
-                for file in self.video_list:
-                    feature_All[file] = np.load(opt["video_feature_all_train"]+file+'.npz')
-                    
-                keys = self.video_list
-                for vidx in range(len(keys)):
-                    self.feature_rgb_file[keys[vidx]]=feature_All[keys[vidx]]['rgb']#np.array(feature_All[keys[vidx]]['rgb'])
-                for vidx in range(len(keys)):
-                    self.feature_flow_file[keys[vidx]]=feature_All[keys[vidx]]['flow']#np.array(feature_All[keys[vidx]]['flow'])
-
-            elif opt['data_format'] == "pt":
-                feature_All = {}
-                self.feature_rgb_file={}
-                self.feature_flow_file={}
-                for file in self.video_list:
-                    feature_All[file] = torch.load(opt["video_feature_all_train"]+file+'.pt')
-                    
-                keys = self.video_list
-                for vidx in range(len(keys)):
-                    self.feature_rgb_file[keys[vidx]]=feature_All[keys[vidx]][:]
-                self.feature_flow_file = None
                             
         else:
             if opt['data_format'] == "h5":
@@ -157,44 +118,7 @@ class VideoDataSet(data.Dataset):
                 for vidx in range(len(keys)):
                     self.feature_rgb_file[keys[vidx]]=feature_All[keys[vidx]]['rgb']#np.array(feature_All[keys[vidx]]['rgb'])
                 for vidx in range(len(keys)):
-                    self.feature_flow_file[keys[vidx]]=feature_All[keys[vidx]]['flow']#np.array(feature_All[keys[vidx]]['flow']) 
-            
-            elif opt['data_format'] == "npz":
-                self.feature_rgb_file={}
-                self.feature_flow_file={}
-                feature_All = {}
-                for file in self.video_list:
-                    feature_All[file] = np.load(opt["video_feature_all_test"]+file+'.npz')['feats']
-                    # print(feature_All[file].shape)
-                keys = self.video_list
-                for vidx in range(len(keys)):
-                    self.feature_rgb_file[keys[vidx]]=feature_All[keys[vidx]][:]
-                self.feature_flow_file = None  
-
-            elif opt['data_format'] == "npz_i3d":
-                feature_All = {}
-                self.feature_rgb_file={}
-                self.feature_flow_file={}
-                for file in self.video_list:
-                    feature_All[file] = np.load(opt["video_feature_all_test"]+file+'.npz')
-                    
-                keys = self.video_list
-                for vidx in range(len(keys)):
-                    self.feature_rgb_file[keys[vidx]]=feature_All[keys[vidx]]['rgb']#np.array(feature_All[keys[vidx]]['rgb'])
-                for vidx in range(len(keys)):
-                    self.feature_flow_file[keys[vidx]]=feature_All[keys[vidx]]['flow']#np.array(feature_All[keys[vidx]]['flow'])
-
-            elif opt['data_format'] == "pt":
-                self.feature_rgb_file={}
-                self.feature_flow_file={}
-                feature_All = {}
-                for file in self.video_list:
-                    feature_All[file] = torch.load(opt["video_feature_all_test"]+file+'.pt')
-                    # print(feature_All[file].shape, feature_All[file].dtype)
-                keys = self.video_list
-                for vidx in range(len(keys)):
-                    self.feature_rgb_file[keys[vidx]]=feature_All[keys[vidx]][:]
-                self.feature_flow_file = None    
+                    self.feature_flow_file[keys[vidx]]=feature_All[keys[vidx]]['flow']#np.array(feature_All[keys[vidx]]['flow'])     
     
     def _loadFeaturelen(self, opt):
         if os.path.exists(self.video_len_path):
@@ -207,36 +131,11 @@ class VideoDataSet(data.Dataset):
                 feature_file = h5py.File(opt["video_feature_rgb_train"], 'r')
             elif opt['data_format'] == "pickle":
                 feature_file = pickle.load(open(opt["video_feature_all_train"], 'rb'))
-            elif opt['data_format'] == "npz":
-                feature_file = {}
-                for file in self.video_list:
-                    feature_file[file] = np.load(opt["video_feature_all_train"]+file+'.npz')['feats']
-            elif opt['data_format'] == "npz_i3d":
-                feature_file = {}
-                for file in self.video_list:
-                    feature_file[file] = np.load(opt["video_feature_all_train"]+file+'.npz')
-            elif opt['data_format'] == "pt":
-                feature_file = {}
-                for file in self.video_list:
-                    feature_file[file] = torch.load(opt["video_feature_all_train"]+file+'.pt')
         else:
             if opt['data_format'] == "h5":
                 feature_file = h5py.File(opt["video_feature_rgb_test"], 'r')
             elif opt['data_format'] == "pickle":
                 feature_file = pickle.load(open(opt["video_feature_all_test"], 'rb'))
-            elif opt['data_format'] == "npz":
-                feature_file = {}
-                for file in self.video_list:
-                    feature_file[file] = np.load(opt["video_feature_all_test"]+file+'.npz')['feats']
-            elif opt['data_format'] == "npz_i3d":
-                feature_file = {}
-                for file in self.video_list:
-                    feature_file[file] = np.load(opt["video_feature_all_test"]+file+'.npz')
-            elif opt['data_format'] == "pt":
-                feature_file = {}
-                for file in self.video_list:
-                    feature_file[file] = torch.load(opt["video_feature_all_test"]+file+'.pt')
-                    
                     
         keys = self.video_list
         if opt['data_format'] == "h5": 
@@ -245,16 +144,7 @@ class VideoDataSet(data.Dataset):
         elif opt['data_format'] == "pickle":
             for vidx in range(len(keys)):
                 self.video_len[keys[vidx]]=len(feature_file[keys[vidx]]['rgb'])
-        elif opt['data_format'] == "npz":
-            for vidx in range(len(keys)):
-                self.video_len[keys[vidx]]=len(feature_file[keys[vidx]])
-        elif opt['data_format'] == "npz_i3d":
-            for vidx in range(len(keys)):
-                self.video_len[keys[vidx]]=len(feature_file[keys[vidx]]['rgb'])
-        elif opt['data_format'] == "pt":
-            for vidx in range(len(keys)):
-                self.video_len[keys[vidx]]=len(feature_file[keys[vidx]])
-        # print(self.video_len)
+        
         outfile=open(self.video_len_path,"w")
         json.dump(self.video_len,outfile, indent=2)
         outfile.close()  
@@ -317,7 +207,7 @@ class VideoDataSet(data.Dataset):
             #feature_flow = self.feature_flow_file[video_name]
             #duration = min(len(feature_rgb), len(feature_flow))
             duration = self.match_score[video_name].shape[0]
-            # print(video_name, duration)
+            
             for i in range(1, duration+1):
                 st = i-self.segment_size
                 ed = i
@@ -330,19 +220,15 @@ class VideoDataSet(data.Dataset):
 
     def _makePropLabelUnit(self, i):
         video_name=self.inputs_all[i][0]
-        st = self.inputs_all[i][1]
         ed = self.inputs_all[i][2]
-        # print(video_name)
+        
         cls_anc=[]
         reg_anc=[]
-
-        ### anchor annotation
         for j in range(0,len(self.anchors)):
             v1 = np.zeros(self.num_of_class)
             v1[-1]=1
             v2 = np.zeros(2)
             v2[-1]=-1e3
-            # print(self.anchors[j])
             y_box = [ed-1, self.anchors[j]]
             
             subset_label=self._get_train_label_with_class(video_name,ed-self.anchors[j],ed)
@@ -365,40 +251,15 @@ class VideoDataSet(data.Dataset):
             
             cls_anc.append(v1)
             reg_anc.append(v2)
-
-        ### snippet level annotation
-        v0 = np.zeros(self.num_of_class)
-        v0[-1]=1
-        segment_size = ed - st
-        y_box = [ed-1, self.anchors[-1]]
-
-        subset_label=self._get_train_label_with_class(video_name,ed-self.anchors[-1],ed)
-        idx_list = []
-        for ii in range(0, subset_label.shape[0]):
-            for jj in range(0, subset_label.shape[1]):
-                idx=int(subset_label[ii,jj])
-                if idx>0 and idx-1 not in idx_list:
-                    idx_list.append(idx-1)
-        
-        for idx in idx_list:
-            target_box = self.gt_action[video_name][idx]
-            cls = int(target_box[2])
-            iou = calc_iou(y_box,target_box)
-            if iou >= 0: #any overlapping
-                v0[cls]=1
-                v0[-1]=0
-
         cls_anc=np.stack(cls_anc, axis=0)
         reg_anc=np.stack(reg_anc, axis=0)
-        cls_snip = np.array(v0)
-        return cls_anc,reg_anc,cls_snip
+        return cls_anc,reg_anc
     
     def _loadPropLabel(self, filename):
         if os.path.exists(filename):
             prop_label_file = h5py.File(filename, 'r')
             self.cls_label=np.array(prop_label_file['cls_label'][:])
             self.reg_label=np.array(prop_label_file['reg_label'][:])
-            self.snip_label=np.array(prop_label_file['snip_label'][:])
             prop_label_file.close()
             self.action_frame_count = np.sum(self.cls_label.reshape((-1,self.cls_label.shape[-1])),axis=0)
             self.action_frame_count=torch.Tensor(self.action_frame_count)
@@ -411,22 +272,17 @@ class VideoDataSet(data.Dataset):
         
         cls_label=[]
         reg_label=[]
-        snip_label=[]
         for i in range(0,len(labels)):
             cls_label.append(labels[i][0])
             reg_label.append(labels[i][1])
-            snip_label.append(labels[i][2])
         self.cls_label=np.stack(cls_label,axis=0)
         self.reg_label=np.stack(reg_label,axis=0)
-        self.snip_label=np.stack(snip_label,axis=0)
         
         outfile = h5py.File(filename, 'w')
         dset_cls = outfile.create_dataset('/cls_label', self.cls_label.shape, maxshape=self.cls_label.shape, chunks=True, dtype=np.float32)
         dset_cls[:,:] = self.cls_label[:,:]  
         dset_reg = outfile.create_dataset('/reg_label', self.reg_label.shape, maxshape=self.reg_label.shape, chunks=True, dtype=np.float32)
         dset_reg[:,:] = self.reg_label[:,:]  
-        dset_snip = outfile.create_dataset('/snip_label', self.snip_label.shape, maxshape=self.snip_label.shape, chunks=True, dtype=np.float32)
-        dset_snip[:,:] = self.snip_label[:,:]  
         outfile.close()
         
         return  
@@ -446,10 +302,8 @@ class VideoDataSet(data.Dataset):
         
         cls_label=torch.Tensor(self.cls_label[data_idx])
         reg_label=torch.Tensor(self.reg_label[data_idx])
-        snip_label = torch.Tensor(self.snip_label[data_idx])
-        # print(cls_label[-1], snip_label)
             
-        return feature,cls_label,reg_label,snip_label
+        return feature,cls_label,reg_label
         
             
     def _get_base_data(self,video_name,st,ed): 
@@ -458,7 +312,6 @@ class VideoDataSet(data.Dataset):
         
         if self.feature_flow_file is not None:
             feature_flow = self.feature_flow_file[video_name]
-            # print(feature_flow.shape)
             feature_flow = feature_flow[st:ed,:]
             feature = np.append(feature_rgb,feature_flow, axis=1)
         else:
@@ -503,7 +356,7 @@ class SuppressDataSet(data.Dataset):
     def __init__(self,opt,subset="train"):
         self.subset = subset
         self.mode = opt["mode"]
-        self.data_file = h5py.File(opt["suppress_label_file"].format(self.subset+"_"+opt['setup']), 'r')
+        self.data_file = h5py.File(opt["suppress_label_file"].format(self.subset), 'r')
         self.video_list = list(self.data_file.keys())
         self.inputs=[]
         for index in range(0,len(self.video_list)):
